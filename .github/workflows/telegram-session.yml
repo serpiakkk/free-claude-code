@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       duration_minutes:
-        description: 'Session length in minutes (10-300; no schedule)'
+        description: 'How long to run (10–300 minutes; no recurring schedule)'
         required: true
         type: number
         default: 60
@@ -13,49 +13,68 @@ permissions:
   contents: read
 
 concurrency:
-  group: temporary-telegram-session
+  group: temporary-telegram-coding-session
   cancel-in-progress: false
 
 jobs:
-  session:
+  telegram:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Check out this repository without a write token
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - name: Validate inputs and credentials
+
+      - name: Validate requested duration and required credentials
+        id: validate
         shell: bash
         env:
-          DURATION: ${{ inputs.duration_minutes }}
-          BOT: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          USER: ${{ secrets.ALLOWED_TELEGRAM_USER_ID }}
-          NIM: ${{ secrets.NVIDIA_NIM_API_KEY }}
+          DURATION_MINUTES: ${{ inputs.duration_minutes }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ALLOWED_TELEGRAM_USER_ID: ${{ secrets.ALLOWED_TELEGRAM_USER_ID }}
+          NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_NIM_API_KEY }}
         run: |
           set -euo pipefail
-          [[ "$DURATION" =~ ^[0-9]+$ ]] && (( DURATION >= 10 && DURATION <= 300 )) || { echo 'Duration must be 10-300 minutes.' >&2; exit 2; }
-          for name in BOT USER NIM; do [[ -n "${!name}" ]] || { echo "Missing required repository secret: $name" >&2; exit 2; }; done
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+          if ! [[ "$DURATION_MINUTES" =~ ^[0-9]+$ ]] || (( DURATION_MINUTES < 10 || DURATION_MINUTES > 300 )); then
+            echo 'Duration must be an integer from 10 to 300 minutes.' >&2
+            exit 2
+          fi
+          for name in TELEGRAM_BOT_TOKEN ALLOWED_TELEGRAM_USER_ID NVIDIA_NIM_API_KEY; do
+            if [[ -z "${!name}" ]]; then
+              echo "Missing required repository Actions secret: $name" >&2
+              exit 2
+            fi
+          done
+          echo "minutes=$DURATION_MINUTES" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python 3.14.10
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: '3.14.10'
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+
+      - name: Set up Node.js for Claude Code CLI
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
-      - name: Install locked FCC and Claude CLI
+
+      - name: Install locked FCC dependencies and Claude Code CLI
+        shell: bash
         run: |
           set -euo pipefail
-          python -m pip install --disable-pip-version-check 'uv==0.10.4'
+          python -m pip install --disable-pip-version-check 'uv==0.13.7'
           uv sync --locked --no-dev
           npm install --global '@anthropic-ai/claude-code@2.1.332'
           uv run fcc-server --version
           claude --version
-      - name: Run private, time-limited Telegram bot
+
+      - name: Run private Telegram session (server output suppressed)
         shell: bash
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           ALLOWED_TELEGRAM_USER_ID: ${{ secrets.ALLOWED_TELEGRAM_USER_ID }}
           NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_NIM_API_KEY }}
-          DURATION: ${{ inputs.duration_minutes }}
+          DURATION_MINUTES: ${{ steps.validate.outputs.minutes }}
           MESSAGING_PLATFORM: telegram
           ALLOWED_DIR: ${{ github.workspace }}
           HOST: 127.0.0.1
@@ -70,10 +89,37 @@ jobs:
           LOG_MESSAGING_ERROR_DETAILS: 'false'
         run: |
           set -euo pipefail
-          echo "Starting temporary private Telegram session for ${DURATION} minutes; FCC output is suppressed from Actions logs."
+          echo "Starting a temporary private Telegram session for ${DURATION_MINUTES} minutes; application logs are suppressed."
           set +e
-          timeout --signal=INT --kill-after=30s "${DURATION}m" uv run fcc-server >/dev/null 2>&1
-          result=$?
+          timeout --signal=INT --kill-after=30s "${DURATION_MINUTES}m" uv run fcc-server >/dev/null 2>&1
+          status=$?
           set -e
-          [[ "$result" -eq 124 ]] || { echo 'FCC stopped unexpectedly; output suppressed to protect chat contents.' >&2; exit 1; }
-          echo 'Session duration reached; runner will shut down and discard its workspace.'
+          if [[ "$status" -ne 124 ]]; then
+            echo 'FCC stopped before the requested timeout; output suppressed to protect chat and code contents.' >&2
+            exit 1
+          fi
+          echo 'Requested session duration completed; the temporary runner is shutting down.'
+
+      - name: Prepare a reviewable patch of changed repository files
+        if: always() && steps.validate.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add -N -- .
+          git diff --binary -- . > session.patch
+          if [[ ! -s session.patch ]]; then
+            rm -f session.patch
+            echo 'No repository changes were made.'
+          else
+            echo 'A patch is ready as a short-lived artifact; it is not committed automatically.'
+          fi
+
+      - name: Upload patch for owner review (one-day retention)
+        if: always() && steps.validate.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: telegram-session-patch
+          path: session.patch
+          if-no-files-found: ignore
+          retention-days: 1
+          compression-level: 0
