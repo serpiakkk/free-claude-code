@@ -1,0 +1,79 @@
+name: Temporary Telegram coding session
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: 'Session length in minutes (10-300; no schedule)'
+        required: true
+        type: number
+        default: 60
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporary-telegram-session
+  cancel-in-progress: false
+
+jobs:
+  session:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Validate inputs and credentials
+        shell: bash
+        env:
+          DURATION: ${{ inputs.duration_minutes }}
+          BOT: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          USER: ${{ secrets.ALLOWED_TELEGRAM_USER_ID }}
+          NIM: ${{ secrets.NVIDIA_NIM_API_KEY }}
+        run: |
+          set -euo pipefail
+          [[ "$DURATION" =~ ^[0-9]+$ ]] && (( DURATION >= 10 && DURATION <= 300 )) || { echo 'Duration must be 10-300 minutes.' >&2; exit 2; }
+          for name in BOT USER NIM; do [[ -n "${!name}" ]] || { echo "Missing required repository secret: $name" >&2; exit 2; }; done
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.14.10'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+      - name: Install locked FCC and Claude CLI
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check 'uv==0.10.4'
+          uv sync --locked --no-dev
+          npm install --global '@anthropic-ai/claude-code@2.1.332'
+          uv run fcc-server --version
+          claude --version
+      - name: Run private, time-limited Telegram bot
+        shell: bash
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ALLOWED_TELEGRAM_USER_ID: ${{ secrets.ALLOWED_TELEGRAM_USER_ID }}
+          NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_NIM_API_KEY }}
+          DURATION: ${{ inputs.duration_minutes }}
+          MESSAGING_PLATFORM: telegram
+          ALLOWED_DIR: ${{ github.workspace }}
+          HOST: 127.0.0.1
+          FCC_OPEN_BROWSER: 'false'
+          MODEL: nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b
+          LOG_LEVEL: WARNING
+          LOG_RAW_MESSAGING_CONTENT: 'false'
+          LOG_RAW_CLI_DIAGNOSTICS: 'false'
+          LOG_RAW_API_PAYLOADS: 'false'
+          LOG_RAW_SSE_EVENTS: 'false'
+          LOG_API_ERROR_TRACEBACKS: 'false'
+          LOG_MESSAGING_ERROR_DETAILS: 'false'
+        run: |
+          set -euo pipefail
+          echo "Starting temporary private Telegram session for ${DURATION} minutes; FCC output is suppressed from Actions logs."
+          set +e
+          timeout --signal=INT --kill-after=30s "${DURATION}m" uv run fcc-server >/dev/null 2>&1
+          result=$?
+          set -e
+          [[ "$result" -eq 124 ]] || { echo 'FCC stopped unexpectedly; output suppressed to protect chat contents.' >&2; exit 1; }
+          echo 'Session duration reached; runner will shut down and discard its workspace.'
